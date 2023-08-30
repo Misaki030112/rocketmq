@@ -65,6 +65,7 @@ import org.apache.rocketmq.common.message.MessageRequestMode;
 import org.apache.rocketmq.common.namesrv.NamesrvUtil;
 import org.apache.rocketmq.common.topic.TopicValidator;
 import org.apache.rocketmq.common.utils.NetworkUtil;
+import org.apache.rocketmq.common.BoundaryType;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 import org.apache.rocketmq.remoting.RPCHook;
@@ -1700,6 +1701,10 @@ public class DefaultMQAdminExtImpl implements MQAdminExt, MQAdminExtInner {
         return this.mqClientInstance.getMQAdminImpl().searchOffset(mq, timestamp);
     }
 
+    public long searchOffset(MessageQueue mq, long timestamp, BoundaryType boundaryType) throws MQClientException {
+        return this.mqClientInstance.getMQAdminImpl().searchOffset(mq, timestamp, boundaryType);
+    }
+
     @Override
     public long maxOffset(MessageQueue mq) throws MQClientException {
         return this.mqClientInstance.getMQAdminImpl().maxOffset(mq);
@@ -1904,5 +1909,32 @@ public class DefaultMQAdminExtImpl implements MQAdminExt, MQAdminExtInner {
 
     public MQClientInstance getMqClientInstance() {
         return mqClientInstance;
+    }
+
+    @Override
+    public void updateColdDataFlowCtrGroupConfig(String brokerAddr, Properties properties)
+        throws RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException,
+        UnsupportedEncodingException, InterruptedException, MQBrokerException {
+        this.mqClientInstance.getMQClientAPIImpl().updateColdDataFlowCtrGroupConfig(brokerAddr, properties, timeoutMillis);
+    }
+
+    @Override
+    public void removeColdDataFlowCtrGroupConfig(String brokerAddr, String consumerGroup)
+        throws RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException,
+        UnsupportedEncodingException, InterruptedException, MQBrokerException {
+        this.mqClientInstance.getMQClientAPIImpl().removeColdDataFlowCtrGroupConfig(brokerAddr, consumerGroup, timeoutMillis);
+    }
+
+    @Override
+    public String getColdDataFlowCtrInfo(String brokerAddr)
+        throws RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException,
+        UnsupportedEncodingException, InterruptedException, MQBrokerException {
+        return this.mqClientInstance.getMQClientAPIImpl().getColdDataFlowCtrInfo(brokerAddr, timeoutMillis);
+    }
+
+    @Override
+    public String setCommitLogReadAheadMode(String brokerAddr, String mode)
+        throws RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException, InterruptedException, MQBrokerException {
+        return this.mqClientInstance.getMQClientAPIImpl().setCommitLogReadAheadMode(brokerAddr, mode, timeoutMillis);
     }
 }

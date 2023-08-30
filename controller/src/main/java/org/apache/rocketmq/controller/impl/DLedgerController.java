@@ -16,6 +16,7 @@
  */
 package org.apache.rocketmq.controller.impl;
 
+import com.google.common.base.Stopwatch;
 import io.openmessaging.storage.dledger.AppendFuture;
 import io.openmessaging.storage.dledger.DLedgerConfig;
 import io.openmessaging.storage.dledger.DLedgerLeaderElector;
@@ -24,6 +25,7 @@ import io.openmessaging.storage.dledger.MemberState;
 import io.openmessaging.storage.dledger.protocol.AppendEntryRequest;
 import io.openmessaging.storage.dledger.protocol.AppendEntryResponse;
 import io.openmessaging.storage.dledger.protocol.BatchAppendEntryRequest;
+import io.opentelemetry.api.common.AttributesBuilder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -32,7 +34,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import org.apache.rocketmq.common.ControllerConfig;
@@ -42,11 +47,14 @@ import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.controller.Controller;
 import org.apache.rocketmq.controller.elect.ElectPolicy;
 import org.apache.rocketmq.controller.elect.impl.DefaultElectPolicy;
+import org.apache.rocketmq.controller.helper.BrokerLifecycleListener;
 import org.apache.rocketmq.controller.helper.BrokerValidPredicate;
 import org.apache.rocketmq.controller.impl.event.ControllerResult;
 import org.apache.rocketmq.controller.impl.event.EventMessage;
 import org.apache.rocketmq.controller.impl.event.EventSerializer;
 import org.apache.rocketmq.controller.impl.manager.ReplicasInfoManager;
+import org.apache.rocketmq.controller.metrics.ControllerMetricsConstant;
+import org.apache.rocketmq.controller.metrics.ControllerMetricsManager;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 import org.apache.rocketmq.remoting.ChannelEventListener;
@@ -58,6 +66,7 @@ import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 import org.apache.rocketmq.remoting.protocol.ResponseCode;
 import org.apache.rocketmq.remoting.protocol.body.SyncStateSet;
 import org.apache.rocketmq.remoting.protocol.header.controller.AlterSyncStateSetRequestHeader;
+import org.apache.rocketmq.remoting.protocol.header.controller.ElectMasterResponseHeader;
 import org.apache.rocketmq.remoting.protocol.header.controller.admin.CleanControllerBrokerDataRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.controller.ElectMasterRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.controller.GetMetaDataResponseHeader;
@@ -65,6 +74,12 @@ import org.apache.rocketmq.remoting.protocol.header.controller.GetReplicaInfoReq
 import org.apache.rocketmq.remoting.protocol.header.controller.register.ApplyBrokerIdRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.controller.register.GetNextBrokerIdRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.controller.register.RegisterBrokerToControllerRequestHeader;
+
+import static org.apache.rocketmq.controller.metrics.ControllerMetricsConstant.LABEL_BROKER_SET;
+import static org.apache.rocketmq.controller.metrics.ControllerMetricsConstant.LABEL_CLUSTER_NAME;
+import static org.apache.rocketmq.controller.metrics.ControllerMetricsConstant.LABEL_DLEDGER_OPERATION;
+import static org.apache.rocketmq.controller.metrics.ControllerMetricsConstant.LABEL_DLEDGER_OPERATION_STATUS;
+import static org.apache.rocketmq.controller.metrics.ControllerMetricsConstant.LABEL_ELECTION_RESULT;
 
 /**
  * The implementation of controller, based on DLedger (raft).
@@ -80,6 +95,11 @@ public class DLedgerController implements Controller {
     private final EventSerializer eventSerializer;
     private final RoleChangeHandler roleHandler;
     private final DLedgerControllerStateMachine statemachine;
+    private final ScheduledExecutorService scanInactiveMasterService;
+
+    private ScheduledFuture scanInactiveMasterFuture;
+
+    private List<BrokerLifecycleListener> brokerLifecycleListeners;
 
     // Usr for checking whether the broker is alive
     private BrokerValidPredicate brokerAlivePredicate;
@@ -116,6 +136,8 @@ public class DLedgerController implements Controller {
         this.dLedgerServer = new DLedgerServer(dLedgerConfig, nettyServerConfig, nettyClientConfig, channelEventListener);
         this.dLedgerServer.registerStateMachine(this.statemachine);
         this.dLedgerServer.getDLedgerLeaderElector().addRoleChangeHandler(this.roleHandler);
+        this.scanInactiveMasterService = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl("DLedgerController_scanInactiveService_"));
+        this.brokerLifecycleListeners = new ArrayList<>();
     }
 
     @Override
@@ -125,6 +147,7 @@ public class DLedgerController implements Controller {
 
     @Override
     public void shutdown() {
+        this.cancelScanInactiveFuture();
         this.dLedgerServer.shutdown();
     }
 
@@ -163,7 +186,30 @@ public class DLedgerController implements Controller {
     @Override
     public CompletableFuture<RemotingCommand> electMaster(final ElectMasterRequestHeader request) {
         return this.scheduler.appendEvent("electMaster",
-            () -> this.replicasInfoManager.electMaster(request, this.electPolicy), true);
+            () -> {
+                ControllerResult<ElectMasterResponseHeader> electResult = this.replicasInfoManager.electMaster(request, this.electPolicy);
+                AttributesBuilder attributesBuilder = ControllerMetricsManager.newAttributesBuilder()
+                    .put(LABEL_CLUSTER_NAME, request.getClusterName())
+                    .put(LABEL_BROKER_SET, request.getBrokerName());
+                switch (electResult.getResponseCode()) {
+                    case ResponseCode.SUCCESS:
+                        ControllerMetricsManager.electionTotal.add(1,
+                            attributesBuilder.put(LABEL_ELECTION_RESULT, ControllerMetricsConstant.ElectionResult.NEW_MASTER_ELECTED.getLowerCaseName()).build());
+                        break;
+                    case ResponseCode.CONTROLLER_MASTER_STILL_EXIST:
+                        ControllerMetricsManager.electionTotal.add(1,
+                            attributesBuilder.put(LABEL_ELECTION_RESULT, ControllerMetricsConstant.ElectionResult.KEEP_CURRENT_MASTER.getLowerCaseName()).build());
+                        break;
+                    case ResponseCode.CONTROLLER_MASTER_NOT_AVAILABLE:
+                    case ResponseCode.CONTROLLER_ELECT_MASTER_FAILED:
+                        ControllerMetricsManager.electionTotal.add(1,
+                            attributesBuilder.put(LABEL_ELECTION_RESULT, ControllerMetricsConstant.ElectionResult.NO_MASTER_ELECTED.getLowerCaseName()).build());
+                        break;
+                    default:
+                        break;
+                }
+                return electResult;
+            }, true);
     }
 
     @Override
@@ -190,7 +236,12 @@ public class DLedgerController implements Controller {
     @Override
     public CompletableFuture<RemotingCommand> getSyncStateData(List<String> brokerNames) {
         return this.scheduler.appendEvent("getSyncStateData",
-            () -> this.replicasInfoManager.getSyncStateData(brokerNames), false);
+            () -> this.replicasInfoManager.getSyncStateData(brokerNames, brokerAlivePredicate), false);
+    }
+
+    @Override
+    public void registerBrokerLifecycleListener(BrokerLifecycleListener listener) {
+        this.brokerLifecycleListeners.add(listener);
     }
 
     @Override
@@ -219,18 +270,55 @@ public class DLedgerController implements Controller {
     }
 
     /**
+     * Scan all broker-set in statemachine, find that the broker-set which
+     * its master has been timeout but still has at least one broker keep alive with controller,
+     * and we trigger an election to update its state.
+     */
+    private void scanInactiveMasterAndTriggerReelect() {
+        if (!this.roleHandler.isLeaderState()) {
+            cancelScanInactiveFuture();
+            return;
+        }
+        List<String> brokerSets = this.replicasInfoManager.scanNeedReelectBrokerSets(this.brokerAlivePredicate);
+        for (String brokerName : brokerSets) {
+            // Notify ControllerManager
+            this.brokerLifecycleListeners.forEach(listener -> listener.onBrokerInactive(null, brokerName, null));
+        }
+    }
+
+    /**
      * Append the request to DLedger, and wait for DLedger to commit the request.
      */
-    private boolean appendToDLedgerAndWait(final AppendEntryRequest request) throws Throwable {
+    private boolean appendToDLedgerAndWait(final AppendEntryRequest request) {
         if (request != null) {
             request.setGroup(this.dLedgerConfig.getGroup());
             request.setRemoteId(this.dLedgerConfig.getSelfId());
-
-            final AppendFuture<AppendEntryResponse> dLedgerFuture = (AppendFuture<AppendEntryResponse>) dLedgerServer.handleAppend(request);
-            if (dLedgerFuture.getPos() == -1) {
+            Stopwatch stopwatch = Stopwatch.createStarted();
+            AttributesBuilder attributesBuilder = ControllerMetricsManager.newAttributesBuilder()
+                .put(LABEL_DLEDGER_OPERATION, ControllerMetricsConstant.DLedgerOperation.APPEND.getLowerCaseName());
+            try {
+                final AppendFuture<AppendEntryResponse> dLedgerFuture = (AppendFuture<AppendEntryResponse>) dLedgerServer.handleAppend(request);
+                if (dLedgerFuture.getPos() == -1) {
+                    ControllerMetricsManager.dLedgerOpTotal.add(1,
+                        attributesBuilder.put(LABEL_DLEDGER_OPERATION_STATUS, ControllerMetricsConstant.DLedgerOperationStatus.FAILED.getLowerCaseName()).build());
+                    return false;
+                }
+                dLedgerFuture.get(5, TimeUnit.SECONDS);
+                ControllerMetricsManager.dLedgerOpTotal.add(1,
+                    attributesBuilder.put(LABEL_DLEDGER_OPERATION_STATUS, ControllerMetricsConstant.DLedgerOperationStatus.SUCCESS.getLowerCaseName()).build());
+                ControllerMetricsManager.dLedgerOpLatency.record(stopwatch.elapsed(TimeUnit.MICROSECONDS),
+                    attributesBuilder.build());
+            } catch (Exception e) {
+                log.error("Failed to append entry to DLedger", e);
+                if (e instanceof TimeoutException) {
+                    ControllerMetricsManager.dLedgerOpTotal.add(1,
+                        attributesBuilder.put(LABEL_DLEDGER_OPERATION_STATUS, ControllerMetricsConstant.DLedgerOperationStatus.TIMEOUT.getLowerCaseName()).build());
+                } else {
+                    ControllerMetricsManager.dLedgerOpTotal.add(1,
+                        attributesBuilder.put(LABEL_DLEDGER_OPERATION_STATUS, ControllerMetricsConstant.DLedgerOperationStatus.FAILED.getLowerCaseName()).build());
+                }
                 return false;
             }
-            dLedgerFuture.get(5, TimeUnit.SECONDS);
             return true;
         }
         return false;
@@ -247,6 +335,13 @@ public class DLedgerController implements Controller {
 
     public void setElectPolicy(ElectPolicy electPolicy) {
         this.electPolicy = electPolicy;
+    }
+
+    private void cancelScanInactiveFuture() {
+        if (this.scanInactiveMasterFuture != null) {
+            this.scanInactiveMasterFuture.cancel(true);
+            this.scanInactiveMasterFuture = null;
+        }
     }
 
     /**
@@ -430,14 +525,18 @@ public class DLedgerController implements Controller {
             Runnable runnable = () -> {
                 switch (role) {
                     case CANDIDATE:
+                        ControllerMetricsManager.recordRole(role, this.currentRole);
                         this.currentRole = MemberState.Role.CANDIDATE;
                         log.info("Controller {} change role to candidate", this.selfId);
                         DLedgerController.this.stopScheduling();
+                        DLedgerController.this.cancelScanInactiveFuture();
                         break;
                     case FOLLOWER:
+                        ControllerMetricsManager.recordRole(role, this.currentRole);
                         this.currentRole = MemberState.Role.FOLLOWER;
                         log.info("Controller {} change role to Follower, leaderId:{}", this.selfId, getMemberState().getLeaderId());
                         DLedgerController.this.stopScheduling();
+                        DLedgerController.this.cancelScanInactiveFuture();
                         break;
                     case LEADER: {
                         log.info("Controller {} change role to leader, try process a initial proposal", this.selfId);
@@ -450,8 +549,15 @@ public class DLedgerController implements Controller {
                             request.setBody(new byte[0]);
                             try {
                                 if (appendToDLedgerAndWait(request)) {
+                                    ControllerMetricsManager.recordRole(role, this.currentRole);
                                     this.currentRole = MemberState.Role.LEADER;
                                     DLedgerController.this.startScheduling();
+                                    if (DLedgerController.this.scanInactiveMasterFuture == null) {
+                                        long scanInactiveMasterInterval = DLedgerController.this.controllerConfig.getScanInactiveMasterInterval();
+                                        DLedgerController.this.scanInactiveMasterFuture =
+                                                DLedgerController.this.scanInactiveMasterService.scheduleAtFixedRate(DLedgerController.this::scanInactiveMasterAndTriggerReelect,
+                                                        scanInactiveMasterInterval, scanInactiveMasterInterval, TimeUnit.MILLISECONDS);
+                                    }
                                     break;
                                 }
                             } catch (final Throwable e) {
